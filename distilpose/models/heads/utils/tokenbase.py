@@ -2,7 +2,10 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import nn
-from timm.models.layers.weight_init import trunc_normal_
+def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
+    """Truncated normal distribution initialization."""
+    import torch.nn.init as init
+    return init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
 import math
 from easydict import EasyDict
 import copy

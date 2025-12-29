@@ -30,6 +30,10 @@ class SDPoseHead(nn.Module):
                  loss_keypoint=None,
                  loss_vis_token_dist=None,
                  loss_kpt_token_dist=None,
+                 loss_ew_heatmap=None,
+                 loss_ew_token_vis=None,
+                 loss_ew_token_kpt=None,
+                 loss_hd_distill=None,
                  tokenpose_cfg=None,
                  train_cfg=None,
                  test_cfg=None):
@@ -50,9 +54,33 @@ class SDPoseHead(nn.Module):
         else:
             self.kpt_token_dist_loss = None
 
+        if loss_ew_heatmap is not None:
+            self.ew_heatmap_loss = build_loss(loss_ew_heatmap)
+        else:
+            self.ew_heatmap_loss = None
+
+        if loss_ew_token_vis is not None:
+            self.ew_token_vis_loss = build_loss(loss_ew_token_vis)
+        else:
+            self.ew_token_vis_loss = None
+
+        if loss_ew_token_kpt is not None:
+            self.ew_token_kpt_loss = build_loss(loss_ew_token_kpt)
+        else:
+            self.ew_token_kpt_loss = None
+
+        if loss_hd_distill is not None:
+            self.hd_distill_loss = build_loss(loss_hd_distill)
+        else:
+            self.hd_distill_loss = None
+
         self.train_cfg = {} if train_cfg is None else train_cfg
         self.test_cfg = {} if test_cfg is None else test_cfg
         self.target_type = self.test_cfg.get('target_type', 'GaussianHeatmap')
+        
+        # For adaptive loss weight scaling
+        self.total_epochs = 330  # Default, will be updated from config
+        self.use_adaptive_ew_weight = True  # Enable adaptive EW loss weight scaling
 
         self.tokenpose_cfg = {} if tokenpose_cfg is None else tokenpose_cfg
 
@@ -93,18 +121,254 @@ class SDPoseHead(nn.Module):
         """
         losses = dict()
         output_len = len(output)
+        
+        # Get device from first output
+        device = output[0].pred.device
 
-        losses['heatmap_loss'] = 0
+        # Initialize losses as torch tensors (not Python int!)
+        heatmap_loss = torch.tensor(0.0, device=device, dtype=torch.float32, requires_grad=True)
         for i in range(output_len):
-            losses['heatmap_loss'] += self.keypoint_loss(output[i].pred, target, target_weight)
+            current_loss = self.keypoint_loss(output[i].pred, target, target_weight)
+            # NaN safety check
+            if not torch.isnan(current_loss) and not torch.isinf(current_loss):
+                heatmap_loss = heatmap_loss + current_loss
+            else:
+                print(f"[WARNING] NaN/Inf detected in heatmap_loss at cycle {i}, skipping...")
+        
+        losses['heatmap_loss'] = heatmap_loss
+        
+        # Token distillation with optional heatmap guidance
         if self.vis_token_dist_loss is not None:
-            losses["vis_dist_loss"] = 0
+            vis_dist_losses = []
             for i in range(output_len-1):
-                losses["vis_dist_loss"] += self.vis_token_dist_loss(output[i].vis_token, output[i+1].vis_token)
+                # Check if loss supports heatmap-based foreground weighting
+                if hasattr(self.vis_token_dist_loss, 'use_spatial_weight'):
+                    # Pass heatmap for foreground weighting
+                    current_loss = self.vis_token_dist_loss(
+                        output[i].vis_token, 
+                        output[i+1].vis_token,
+                        heatmap=output[i].pred.detach()  # Use teacher (Cycle 1) heatmap
+                    )
+                else:
+                    # Standard distillation without spatial weighting
+                    current_loss = self.vis_token_dist_loss(
+                        output[i].vis_token, 
+                        output[i+1].vis_token
+                    )
+                
+                # NaN safety check and collect valid losses
+                if not torch.isnan(current_loss) and not torch.isinf(current_loss):
+                    vis_dist_losses.append(current_loss)
+            
+            # Use mean instead of sum to prevent accumulation explosion
+            if len(vis_dist_losses) > 0:
+                vis_dist_loss = torch.stack(vis_dist_losses).mean()
+            else:
+                vis_dist_loss = torch.tensor(0.0, device=device, dtype=torch.float32, requires_grad=True)
+            
+            losses["vis_dist_loss"] = vis_dist_loss
+        
         if self.kpt_token_dist_loss is not None:
-            losses["kpt_dist_loss"] = 0
+            kpt_dist_losses = []
             for i in range(output_len-1):
-                losses["kpt_dist_loss"] += self.kpt_token_dist_loss(output[i].kpt_token, output[i+1].kpt_token)
+                # Keypoint tokens already focus on keypoints, less need for spatial weighting
+                # But can still benefit from visibility weighting
+                if hasattr(self.kpt_token_dist_loss, 'use_keypoint_guidance'):
+                    current_loss = self.kpt_token_dist_loss(
+                        output[i].kpt_token, 
+                        output[i+1].kpt_token,
+                        heatmap=output[i].pred.detach(),
+                        target_weight=target_weight
+                    )
+                else:
+                    current_loss = self.kpt_token_dist_loss(
+                        output[i].kpt_token, 
+                        output[i+1].kpt_token
+                    )
+                
+                # NaN safety check and collect valid losses
+                if not torch.isnan(current_loss) and not torch.isinf(current_loss):
+                    kpt_dist_losses.append(current_loss)
+            
+            # Use mean instead of sum to prevent accumulation explosion
+            if len(kpt_dist_losses) > 0:
+                kpt_dist_loss = torch.stack(kpt_dist_losses).mean()
+            else:
+                kpt_dist_loss = torch.tensor(0.0, device=device, dtype=torch.float32, requires_grad=True)
+            
+            losses["kpt_dist_loss"] = kpt_dist_loss
+
+        # Entropy-weighted distillation (requires at least Cycle-2 output)
+        if output_len >= 2:
+            teacher_idx = 1  # Cycle-2 supervises Cycle-1
+
+            if self.ew_heatmap_loss is not None:
+                # Enhanced debugging: Check inputs before loss calculation
+                import logging
+                logger = logging.getLogger(__name__)
+                
+                # Update epoch info in loss function for temperature annealing
+                if hasattr(self.ew_heatmap_loss, 'current_epoch'):
+                    self.ew_heatmap_loss.current_epoch = self.epoch
+                if hasattr(self.ew_heatmap_loss, 'total_epochs'):
+                    self.ew_heatmap_loss.total_epochs = self.total_epochs
+                
+                # Input validation
+                student_pred = output[0].pred
+                teacher_pred = output[teacher_idx].pred.detach()
+                
+                # Debug: Check for invalid inputs (first iteration of each epoch)
+                if not hasattr(self, '_ew_debug_logged') or self._ew_debug_logged != self.epoch:
+                    if torch.isnan(student_pred).any() or torch.isnan(teacher_pred).any():
+                        logger.warning(f"[EW_DEBUG] Epoch {self.epoch}: NaN detected in inputs!")
+                    if torch.isinf(student_pred).any() or torch.isinf(teacher_pred).any():
+                        logger.warning(f"[EW_DEBUG] Epoch {self.epoch}: Inf detected in inputs!")
+                    logger.info(f"[EW_DEBUG] Epoch {self.epoch}: student_pred shape={student_pred.shape}, "
+                              f"teacher_pred shape={teacher_pred.shape}, target shape={target.shape}")
+                    self._ew_debug_logged = self.epoch
+                
+                ew_hm_loss_raw = self.ew_heatmap_loss(
+                    student_pred,
+                    teacher_pred,
+                    target,
+                    target_weight)
+                
+                # Adaptive loss weight scaling
+                weight_factor = 1.0
+                if self.use_adaptive_ew_weight:
+                    # Gradually increase EW Loss weight during training
+                    # Epoch 0-50: 0.5x (약한 영향으로 안정적 학습)
+                    # Epoch 50-150: 0.5x → 1.0x (선형 증가)
+                    # Epoch 150+: 1.0x (원래 weight)
+                    if self.epoch < 50:
+                        weight_factor = 0.5
+                    elif self.epoch < 150:
+                        progress = (self.epoch - 50) / 100.0
+                        weight_factor = 0.5 + 0.5 * progress
+                    else:
+                        weight_factor = 1.0
+                
+                # Enhanced debugging: Log raw loss value periodically
+                losses['ew_heatmap_loss'] = ew_hm_loss_raw * weight_factor
+                loss_val = ew_hm_loss_raw.item()
+                
+                # Log at epoch start and periodically
+                if (self.epoch == 1 and not hasattr(self, '_ew_first_logged')) or \
+                   (self.epoch % 10 == 0 and not hasattr(self, f'_ew_epoch_{self.epoch}_logged')):
+                    logger.info(f"[EW_DEBUG] Epoch {self.epoch}: EW Heatmap Loss (raw)={loss_val:.10f}, "
+                              f"output_len={output_len}, teacher_idx={teacher_idx}")
+                    if self.epoch == 1:
+                        self._ew_first_logged = True
+                    else:
+                        setattr(self, f'_ew_epoch_{self.epoch}_logged', True)
+                
+                # Warning if loss is suspiciously small or zero
+                if abs(loss_val) < 1e-8:
+                    logger.warning(f"[EW_DEBUG] Epoch {self.epoch}: EW Heatmap Loss is very small ({loss_val:.10f})!")
+
+            if self.ew_token_vis_loss is not None:
+                # Update epoch info in loss function
+                if hasattr(self.ew_token_vis_loss, 'current_epoch'):
+                    self.ew_token_vis_loss.current_epoch = self.epoch
+                if hasattr(self.ew_token_vis_loss, 'total_epochs'):
+                    self.ew_token_vis_loss.total_epochs = self.total_epochs
+                
+                ew_tok_vis_loss_raw = self.ew_token_vis_loss(
+                    output[0].vis_token,
+                    output[teacher_idx].vis_token,
+                    output[teacher_idx].pred.detach(),
+                    target_weight)
+                
+                # Adaptive loss weight scaling
+                weight_factor = 1.0
+                if self.use_adaptive_ew_weight:
+                    if self.epoch < 50:
+                        weight_factor = 0.5
+                    elif self.epoch < 150:
+                        progress = (self.epoch - 50) / 100.0
+                        weight_factor = 0.5 + 0.5 * progress
+                    else:
+                        weight_factor = 1.0
+                
+                losses['ew_token_vis_loss'] = ew_tok_vis_loss_raw * weight_factor
+                # Enhanced debugging: Periodic logging
+                import logging
+                logger = logging.getLogger(__name__)
+                loss_val = ew_tok_vis_loss_raw.item()
+                if (self.epoch == 1 and not hasattr(self, '_ew_token_vis_first_logged')) or \
+                   (self.epoch % 10 == 0 and not hasattr(self, f'_ew_token_vis_epoch_{self.epoch}_logged')):
+                    logger.info(f"[EW_DEBUG] Epoch {self.epoch}: EW Token Vis Loss (raw)={loss_val:.10f}")
+                    if self.epoch == 1:
+                        self._ew_token_vis_first_logged = True
+                    else:
+                        setattr(self, f'_ew_token_vis_epoch_{self.epoch}_logged', True)
+                if abs(loss_val) < 1e-8:
+                    logger.warning(f"[EW_DEBUG] Epoch {self.epoch}: EW Token Vis Loss is very small ({loss_val:.10f})!")
+
+            if self.ew_token_kpt_loss is not None:
+                # Update epoch info in loss function
+                if hasattr(self.ew_token_kpt_loss, 'current_epoch'):
+                    self.ew_token_kpt_loss.current_epoch = self.epoch
+                if hasattr(self.ew_token_kpt_loss, 'total_epochs'):
+                    self.ew_token_kpt_loss.total_epochs = self.total_epochs
+                
+                ew_tok_kpt_loss_raw = self.ew_token_kpt_loss(
+                    output[0].kpt_token,
+                    output[teacher_idx].kpt_token,
+                    output[teacher_idx].pred.detach(),
+                    target_weight)
+                
+                # Adaptive loss weight scaling
+                weight_factor = 1.0
+                if self.use_adaptive_ew_weight:
+                    if self.epoch < 50:
+                        weight_factor = 0.5
+                    elif self.epoch < 150:
+                        progress = (self.epoch - 50) / 100.0
+                        weight_factor = 0.5 + 0.5 * progress
+                    else:
+                        weight_factor = 1.0
+                
+                losses['ew_token_kpt_loss'] = ew_tok_kpt_loss_raw * weight_factor
+                # Enhanced debugging: Periodic logging
+                import logging
+                logger = logging.getLogger(__name__)
+                loss_val = ew_tok_kpt_loss_raw.item()
+                if (self.epoch == 1 and not hasattr(self, '_ew_token_kpt_first_logged')) or \
+                   (self.epoch % 10 == 0 and not hasattr(self, f'_ew_token_kpt_epoch_{self.epoch}_logged')):
+                    logger.info(f"[EW_DEBUG] Epoch {self.epoch}: EW Token Kpt Loss (raw)={loss_val:.10f}")
+                    if self.epoch == 1:
+                        self._ew_token_kpt_first_logged = True
+                    else:
+                        setattr(self, f'_ew_token_kpt_epoch_{self.epoch}_logged', True)
+                if abs(loss_val) < 1e-8:
+                    logger.warning(f"[EW_DEBUG] Epoch {self.epoch}: EW Token Kpt Loss is very small ({loss_val:.10f})!")
+
+        # HD-Distill: Hard-aware Dynamic Distillation
+        # 마지막 cycle (teacher)와 이전 cycles (student) 간 weighted distillation
+        if self.hd_distill_loss is not None and output_len >= 2:
+            hd_distill_losses = []
+            final_cycle_idx = output_len - 1  # 마지막 cycle이 teacher
+            
+            for i in range(final_cycle_idx):
+                # 각 cycle i의 heatmap과 마지막 cycle의 heatmap 간 HD-Distill
+                current_loss = self.hd_distill_loss(
+                    output[i].pred,                    # student heatmaps [B, J, H, W]
+                    output[final_cycle_idx].pred.detach(),  # teacher (final cycle) [B, J, H, W]
+                    target                              # GT heatmaps [B, J, H, W]
+                )
+                
+                # NaN safety check
+                if not torch.isnan(current_loss) and not torch.isinf(current_loss):
+                    hd_distill_losses.append(current_loss)
+            
+            # Average over all cycles
+            if len(hd_distill_losses) > 0:
+                hd_distill_loss = torch.stack(hd_distill_losses).mean()
+            else:
+                hd_distill_loss = torch.tensor(0.0, device=device, dtype=torch.float32, requires_grad=True)
+            
+            losses['hd_distill_loss'] = hd_distill_loss
 
         return losses
 

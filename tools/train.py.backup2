@@ -11,10 +11,7 @@ from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist, set_random_seed
 from mmcv.utils import get_git_hash
 
-try:
-    from mmpose import __version__
-except ImportError:
-    __version__ = "0.29.0"
+from mmpose import __version__
 from mmpose.apis import init_random_seed, train_model
 from mmpose.utils import collect_env, get_root_logger
 
@@ -144,10 +141,7 @@ def main():
 
     # log some basic info
     logger.info(f'Distributed training: {distributed}')
-    try:
-        logger.info(f'Config:\n{cfg.pretty_text}')
-    except TypeError:
-        logger.info(f'Config:\n{cfg}')
+    logger.info(f'Config:\n{cfg.pretty_text}')
 
     # set random seeds
     seed = init_random_seed(args.seed)
@@ -170,7 +164,7 @@ def main():
         # checkpoints as meta data
         cfg.checkpoint_config.meta = dict(
             mmpose_version=__version__ + get_git_hash(digits=7),
-            config=str(cfg),
+            config=cfg.pretty_text,
         )
 
     train_model(
