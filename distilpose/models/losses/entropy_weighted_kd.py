@@ -52,7 +52,12 @@ class EntropyWeightedKDLoss(nn.Module):
                  mask_blur_kernel=3,
                  mask_blur_iters=1,
                  visibility_floor=0.0,
-                 kl_mode=True):
+                 kl_mode=True,
+                 normalize_by_area=True,
+                 scale_by_temperature=True,
+                 loss_scale=1.0,
+                 warn_threshold=1e-12,
+                 use_weighted_distribution=True):
         super().__init__()
         self.base_temperature = base_temperature
         self.temp_beta = temp_beta
@@ -66,6 +71,11 @@ class EntropyWeightedKDLoss(nn.Module):
         self.mask_blur_iters = mask_blur_iters
         self.visibility_floor = visibility_floor
         self.kl_mode = kl_mode
+        self.normalize_by_area = normalize_by_area
+        self.scale_by_temperature = scale_by_temperature
+        self.loss_scale = loss_scale
+        self.warn_threshold = warn_threshold
+        self.use_weighted_distribution = use_weighted_distribution
         
         # For temperature annealing and adaptive weight scaling
         self.current_epoch = 0
@@ -83,6 +93,9 @@ class EntropyWeightedKDLoss(nn.Module):
         print(f"  T0={base_temperature}, β={temp_beta}")
         print(f"  weight_range=[{weight_min}, {weight_max}]")
         print(f"  foreground_mask={use_foreground_mask}, KL={kl_mode}")
+        print(f"  normalize_by_area={normalize_by_area}, scale_by_temperature={scale_by_temperature}")
+        print(f"  loss_scale={loss_scale}, warn_threshold={warn_threshold:.1e}")
+        print(f"  use_weighted_distribution={use_weighted_distribution}")
         print(f"  Temperature annealing={self.use_temperature_annealing}")
         print(f"  Robust normalization={self.use_robust_normalization}")
     
@@ -268,15 +281,42 @@ class EntropyWeightedKDLoss(nn.Module):
         if self.kl_mode:
             # KL divergence with adaptive temperature
             # Teacher: high temp (softer), Student: adaptive temp
-            teacher_soft = F.softmax(teacher_logits.view(B, K, -1) / T_adaptive.view(B, K, -1), dim=-1)
-            student_soft = F.log_softmax(student_logits.view(B, K, -1) / T_adaptive.view(B, K, -1), dim=-1)
-            
-            # KL(teacher || student)
-            kl_loss = F.kl_div(student_soft, teacher_soft, reduction='none')  # [B, K, H*W]
-            kl_loss = kl_loss.view(B, K, H, W)  # [B, K, H, W]
-            
-            # Apply adaptive weights
-            weighted_loss = kl_loss * w_adaptive  # [B, K, H, W]
+            temp_flat = T_adaptive.view(B, K, -1)
+            teacher_soft = F.softmax(teacher_logits.view(B, K, -1) / temp_flat, dim=-1)
+            student_log_soft = F.log_softmax(student_logits.view(B, K, -1) / temp_flat, dim=-1)
+
+            if self.use_weighted_distribution:
+                weight_map = w_adaptive
+                if target_weight is not None:
+                    vis_weight = target_weight.unsqueeze(-1)  # [B, K, 1, 1]
+                    if self.visibility_floor > 0:
+                        vis_weight = torch.clamp(vis_weight, min=self.visibility_floor)
+                    weight_map = weight_map * vis_weight
+
+                weight_flat = weight_map.view(B, K, -1)
+                weight_flat = weight_flat / (weight_flat.sum(dim=-1, keepdim=True) + 1e-12)
+
+                teacher_prob_w = teacher_soft * weight_flat
+                teacher_prob_w = teacher_prob_w / (teacher_prob_w.sum(dim=-1, keepdim=True) + 1e-12)
+
+                student_prob = torch.exp(student_log_soft)
+                student_prob_w = student_prob * weight_flat
+                student_prob_w = student_prob_w / (student_prob_w.sum(dim=-1, keepdim=True) + 1e-12)
+                student_log_prob_w = torch.log(student_prob_w + 1e-12)
+
+                kl_loss = teacher_prob_w * (torch.log(teacher_prob_w + 1e-12) - student_log_prob_w)
+                kl_loss = kl_loss.sum(dim=-1)  # [B, K]
+                if self.scale_by_temperature:
+                    kl_loss = kl_loss * (temp_flat.mean(dim=-1) ** 2)
+
+                weighted_loss = kl_loss
+            else:
+                # KL(teacher || student)
+                kl_loss = F.kl_div(student_log_soft, teacher_soft, reduction='none')  # [B, K, H*W]
+                kl_loss = kl_loss.view(B, K, H, W)  # [B, K, H, W]
+                if self.scale_by_temperature:
+                    kl_loss = kl_loss * (T_adaptive ** 2)
+                weighted_loss = kl_loss * w_adaptive  # [B, K, H, W]
             
         else:
             # MSE with adaptive weights
@@ -284,7 +324,7 @@ class EntropyWeightedKDLoss(nn.Module):
             weighted_loss = diff * w_adaptive
         
         # 7. Apply target weight (visibility)
-        if target_weight is not None:
+        if target_weight is not None and not (self.kl_mode and self.use_weighted_distribution):
             # target_weight: [B, K, 1] → [B, K, 1, 1]
             vis_weight = target_weight.unsqueeze(-1)  # [B, K, 1, 1]
             if self.visibility_floor > 0:
@@ -292,11 +332,17 @@ class EntropyWeightedKDLoss(nn.Module):
             weighted_loss = weighted_loss * vis_weight
             
             # Normalize by visible keypoints
-            denominator = (vis_weight.sum() * H * W) + 1e-6
+            denominator = vis_weight.sum() + 1e-6
+            if self.normalize_by_area:
+                denominator = denominator * H * W
             loss = weighted_loss.sum() / denominator
         else:
             loss = weighted_loss.mean()
         
+        # Apply loss scale before final checks
+        if self.loss_scale != 1.0:
+            loss = loss * self.loss_scale
+
         # Enhanced final safety check with detailed logging
         if torch.isnan(loss) or torch.isinf(loss):
             import warnings
@@ -305,7 +351,7 @@ class EntropyWeightedKDLoss(nn.Module):
         
         # Check if loss is suspiciously small (possible calculation error)
         loss_value = loss.item()
-        if abs(loss_value) < 1e-10:
+        if abs(loss_value) < self.warn_threshold:
             import warnings
             warnings.warn(f"[EntropyWeightedKDLoss] Loss is extremely small ({loss_value:.10e}). This might indicate a calculation error.")
         
@@ -333,7 +379,9 @@ class EntropyWeightedTokenKDLoss(nn.Module):
                  eps=1e-6,
                  visibility_floor=0.0,
                  detach_teacher=True,
-                 normalize_per_instance=True):
+                 normalize_per_instance=True,
+                 loss_scale=1.0,
+                 warn_threshold=1e-12):
         super().__init__()
         self.loss_weight = loss_weight
         self.weight_min = weight_min
@@ -342,6 +390,8 @@ class EntropyWeightedTokenKDLoss(nn.Module):
         self.visibility_floor = visibility_floor
         self.detach_teacher = detach_teacher
         self.normalize_per_instance = normalize_per_instance
+        self.loss_scale = loss_scale
+        self.warn_threshold = warn_threshold
         self.cosine_similarity = nn.CosineSimilarity(dim=-1)
         
         # For enhanced entropy normalization (token-level)
@@ -463,7 +513,14 @@ class EntropyWeightedTokenKDLoss(nn.Module):
         # Safety check
         if torch.isnan(loss) or torch.isinf(loss):
             return torch.tensor(0.0, device=student_tokens.device, requires_grad=True)
-        
+
+        if self.loss_scale != 1.0:
+            loss = loss * self.loss_scale
+
+        if abs(loss.item()) < self.warn_threshold:
+            import warnings
+            warnings.warn(f"[EntropyWeightedTokenKDLoss] Loss is extremely small ({loss.item():.10e}).")
+
         return loss * self.loss_weight
 
 
